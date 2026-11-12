@@ -620,21 +620,49 @@ function smooth3(a) {
 }
 // Nouveau rendu des traits : la courbe passe exactement par les points du stylet (Catmull-Rom),
 // puis le trait est construit en disques + raccords, tous orientés dans le même sens : aucun trou possible.
+// Lissage symétrique (points d'avant ET d'après) : enlève le tremblement de la pointe sans retarder le trait
+function smoothPts(p, sigma) { // moyenne gaussienne selon la distance parcourue, pas selon le nombre de points
+  const n = p.length / 3; if (n < 3) return p.slice();
+  const sl = new Float64Array(n); for (let i = 1; i < n; i++) sl[i] = sl[i - 1] + dist(p[i * 3 - 3], p[i * 3 - 2], p[i * 3], p[i * 3 + 1]);
+  const q = p.slice(), L = sl[n - 1], k2 = 1 / (2 * sigma * sigma);
+  for (let i = 1; i < n - 1; i++) {
+    const win = Math.min(3 * sigma, sl[i], L - sl[i]); if (win <= 0) continue; // près des bouts, la fenêtre rétrécit : le trait commence et finit où la pointe s'est posée
+    let sx = 0, sy = 0, sw = 0;
+    for (let j = i; j >= 0 && sl[i] - sl[j] <= win; j--) { const d = sl[i] - sl[j], wt = Math.exp(-d * d * k2); sx += p[j * 3] * wt; sy += p[j * 3 + 1] * wt; sw += wt; }
+    for (let j = i + 1; j < n && sl[j] - sl[i] <= win; j++) { const d = sl[j] - sl[i], wt = Math.exp(-d * d * k2); sx += p[j * 3] * wt; sy += p[j * 3 + 1] * wt; sw += wt; }
+    q[i * 3] = sx / sw; q[i * 3 + 1] = sy / sw;
+  }
+  return q;
+}
+function smoothAlong(p, vals, sigma) { // lisse une valeur (épaisseur) selon la distance parcourue
+  const n = vals.length; if (n < 3) return vals;
+  const sl = new Float64Array(n); for (let i = 1; i < n; i++) sl[i] = sl[i - 1] + dist(p[i * 3 - 3], p[i * 3 - 2], p[i * 3], p[i * 3 + 1]);
+  const out = new Array(n), k2 = 1 / (2 * sigma * sigma), win = 3 * sigma;
+  for (let i = 0; i < n; i++) {
+    let s = 0, sw = 0;
+    for (let j = i; j >= 0 && sl[i] - sl[j] <= win; j--) { const d = sl[i] - sl[j], wt = Math.exp(-d * d * k2); s += vals[j] * wt; sw += wt; }
+    for (let j = i + 1; j < n && sl[j] - sl[i] <= win; j++) { const d = sl[j] - sl[i], wt = Math.exp(-d * d * k2); s += vals[j] * wt; sw += wt; }
+    out[i] = s / sw;
+  }
+  return out;
+}
 function strokeWidths(p, k, w) {
   const n = p.length / 3; let ws = new Array(n);
+  // direction mesurée sur au moins 3 unités de trait, pour que la plume ne « vibre » pas
+  const far = (i, dir) => { let j = i; while (j + dir >= 0 && j + dir < n && dist(p[i * 3], p[i * 3 + 1], p[j * 3], p[j * 3 + 1]) < 3) j += dir; return j; };
   for (let i = 0; i < n; i++) {
     const pr = p[i * 3 + 2];
     if (k === 'nib') {
-      const a = Math.max(0, i - 2), b = Math.min(n - 1, i + 2);
+      const a = far(i, -1), b = far(i, 1);
       const th = Math.atan2(p[b * 3 + 1] - p[a * 3 + 1], p[b * 3] - p[a * 3]);
       ws[i] = w * (.14 + .86 * Math.abs(Math.sin(th - NIB))) * (.65 + .55 * pr);
     } else ws[i] = w * (.35 + .8 * pr);
   }
-  ws = smooth3(smooth3(ws));
+  ws = smoothAlong(p, ws, Math.max(2.5, w * .45)); // la pression varie en douceur sur la longueur : bords réguliers
   if (k === 'pen' && n > 6) { ws[0] *= .6; ws[1] *= .8; ws[2] *= .92; ws[n - 1] *= .65; ws[n - 2] *= .85; }
   return ws;
 }
-function sampleStroke(p, ws, step) { // points intermédiaires sur une courbe lisse qui passe par chaque point saisi
+function sampleStroke(p, ws, step) { // points intermédiaires sur une courbe lisse qui passe par chaque point
   const n = p.length / 3, out = [];
   const P_ = i => { i = clamp(i, 0, n - 1); return [p[i * 3], p[i * 3 + 1]]; };
   for (let i = 0; i < n - 1; i++) {
@@ -650,25 +678,32 @@ function sampleStroke(p, ws, step) { // points intermédiaires sur une courbe li
   out.push(p[(n - 1) * 3], p[(n - 1) * 3 + 1], ws[n - 1]);
   return out;
 }
-// Le trait est découpé en tronçons d'épaisseur presque constante, chacun tracé avec des bouts et jointures arrondis :
-// aucun trou possible, et c'est rapide (quelques appels par trait).
-function buildRuns(p, k, w) {
-  const n = p.length / 3, runs = [];
-  if (n === 0) return runs;
-  if (n === 1) { const r = Math.max(.6, w * (k === 'nib' ? .3 : .45) * (.5 + .7 * p[2])); const pa = new Path2D(); pa.moveTo(p[0], p[1]); pa.lineTo(p[0] + .01, p[1]); runs.push({ w: r * 2, p: pa }); return runs; }
-  const ws = strokeWidths(p, k, w), q = sampleStroke(p, ws, Math.max(1, Math.min(3, w * .35))), m = q.length / 3;
-  const tol = Math.max(.12, w * .035);
-  let cur = null, sum = 0, cnt = 0;
+// Le trait = un contour lisse (bords nets) + un cœur tracé en tronçons arrondis qui bouche tout trou éventuel
+function buildStroke(p, k, w) {
+  const n = p.length / 3, res = { outline: null, runs: [] };
+  if (n === 0) return res;
+  if (n === 1) { const r = Math.max(.6, w * (k === 'nib' ? .3 : .45) * (.5 + .7 * p[2])); const o = new Path2D(); o.moveTo(p[0] + r, p[1]); o.arc(p[0], p[1], r, 0, Math.PI * 2); res.outline = o; return res; }
+  const sp = smoothPts(p, clamp(1.6 + w * .08, 1.6, 3.2)), ws = strokeWidths(sp, k, w), q = sampleStroke(sp, ws, 1), m = q.length / 3;
+  // contour
+  const L = [], R = [];
   for (let i = 0; i < m; i++) {
-    const x = q[i * 3], y = q[i * 3 + 1], wd = Math.max(.7, q[i * 3 + 2]);
-    if (!cur || Math.abs(wd - cur.w0) > tol) {
-      if (cur) { cur.p.lineTo(x, y); cur.w = sum / cnt; }
-      cur = { w0: wd, p: new Path2D(), w: wd }; cur.p.moveTo(i ? q[i * 3 - 3] : x, i ? q[i * 3 - 2] : y); if (!i) cur.p.lineTo(x + .01, y); runs.push(cur); sum = 0; cnt = 0;
-    }
-    if (i) cur.p.lineTo(x, y); sum += wd; cnt++;
+    const a = Math.max(0, i - 2), b = Math.min(m - 1, i + 2);
+    let tx = q[b * 3] - q[a * 3], ty = q[b * 3 + 1] - q[a * 3 + 1]; const l = Math.hypot(tx, ty) || 1; tx /= l; ty /= l;
+    const r = Math.max(.4, q[i * 3 + 2] / 2), x = q[i * 3], y = q[i * 3 + 1];
+    L.push([x - ty * r, y + tx * r]); R.push([x + ty * r, y - tx * r]);
   }
-  if (cur && cnt) cur.w = sum / cnt;
-  return runs;
+  const ang = (i, sgn) => { const a = Math.max(0, i - 2), b = Math.min(m - 1, i + 2); return Math.atan2(q[b * 3 + 1] - q[a * 3 + 1], q[b * 3] - q[a * 3]) + sgn * Math.PI / 2; };
+  const o = new Path2D();
+  o.moveTo(L[0][0], L[0][1]); for (let i = 1; i < m; i++) o.lineTo(L[i][0], L[i][1]);
+  o.arc(q[(m - 1) * 3], q[(m - 1) * 3 + 1], Math.max(.4, q[(m - 1) * 3 + 2] / 2), ang(m - 1, 1), ang(m - 1, 1) - Math.PI, true);
+  for (let i = m - 2; i >= 0; i--) o.lineTo(R[i][0], R[i][1]);
+  o.arc(q[0], q[1], Math.max(.4, q[2] / 2), ang(0, -1), ang(0, -1) - Math.PI, true);
+  o.closePath(); res.outline = o;
+  // cœur : un seul tracé, plus fin que le trait le plus fin, qui bouche les trous possibles dans les boucles serrées
+  let mn = Infinity; for (let i = 0; i < m; i++) mn = Math.min(mn, q[i * 3 + 2]);
+  const core = new Path2D(); core.moveTo(q[0], q[1]); for (let i = 1; i < m; i++) core.lineTo(q[i * 3], q[i * 3 + 1]);
+  res.runs.push({ w: Math.max(.5, mn * .8), p: core });
+  return res;
 }
 function polyPath(p) {
   const n = p.length / 3, path = new Path2D(); if (!n) return path;
@@ -683,15 +718,17 @@ function strokePath(it) { // surligneur et feutre : un seul tracé d'épaisseur 
   if (!pth) { pth = polyPath(it.p); pathCache.set(it, pth); }
   return pth;
 }
-function strokeRuns(it) {
+function strokeShape(it) {
   let r = pathCache.get(it);
-  if (!r) { r = buildRuns(it.p, it.k, it.w); pathCache.set(it, r); }
+  if (!r) { r = buildStroke(it.p, it.k, it.w); pathCache.set(it, r); }
   return r;
 }
 function drawStroke(ctx, it) {
   if (it.t === 's' && it.k !== 'marker') {
-    ctx.save(); ctx.strokeStyle = it.c; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (const r of strokeRuns(it)) { ctx.lineWidth = r.w; ctx.stroke(r.p); }
+    const sh = strokeShape(it);
+    ctx.save(); ctx.fillStyle = ctx.strokeStyle = it.c; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (sh.outline) ctx.fill(sh.outline, 'nonzero');
+    for (const r of sh.runs) { ctx.lineWidth = r.w; ctx.stroke(r.p); }
     ctx.restore(); return;
   }
   const pth = strokePath(it);
