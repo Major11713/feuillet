@@ -527,8 +527,10 @@ function pageRecord(pg) { return { id: pg.id, nb: pg.nb, h: pg.h || PH, bg: pg.b
 function markDirty(pg) {
   pg.v = (pg.v || 0) + 1; dirty.add(pg);
   if (S.nb) { S.nb.updated = Date.now(); dirty.add(S.nb); }
-  clearTimeout(saveT); saveT = setTimeout(flushSaves, 250);
+  clearTimeout(saveT); saveT = setTimeout(autoSave, 250);
 }
+// enregistrement automatique : jamais au milieu d'un trait (sur une page très remplie, ça ferait un petit à-coup sous le stylet)
+function autoSave() { if (typeof G !== 'undefined' && G && G.mode === 'draw') { clearTimeout(saveT); saveT = setTimeout(autoSave, 200); return; } flushSaves(); }
 let saving = null, saveFails = 0;
 async function flushSaves() {
   clearTimeout(saveT);
@@ -646,10 +648,10 @@ function smoothAlong(p, vals, sigma) { // lisse une valeur (épaisseur) selon la
   }
   return out;
 }
-function strokeWidths(p, k, w) {
+function strokeWidths(p, k, w, f = 1, exact) {
   const n = p.length / 3; let ws = new Array(n);
   // direction mesurée sur au moins 3 unités de trait, pour que la plume ne « vibre » pas
-  const far = (i, dir) => { let j = i; while (j + dir >= 0 && j + dir < n && dist(p[i * 3], p[i * 3 + 1], p[j * 3], p[j * 3 + 1]) < 3) j += dir; return j; };
+  const far = (i, dir) => { let j = i; while (j + dir >= 0 && j + dir < n && dist(p[i * 3], p[i * 3 + 1], p[j * 3], p[j * 3 + 1]) < 3 * f) j += dir; return j; };
   for (let i = 0; i < n; i++) {
     const pr = p[i * 3 + 2];
     if (k === 'nib') {
@@ -658,8 +660,12 @@ function strokeWidths(p, k, w) {
       ws[i] = w * (.14 + .86 * Math.abs(Math.sin(th - NIB))) * (.65 + .55 * pr);
     } else ws[i] = w * (.35 + .8 * pr);
   }
-  ws = smoothAlong(p, ws, Math.max(2.5, w * .45)); // la pression varie en douceur sur la longueur : bords réguliers
-  if (k === 'pen' && n > 6) { ws[0] *= .6; ws[1] *= .8; ws[2] *= .92; ws[n - 1] *= .65; ws[n - 2] *= .85; }
+  ws = smoothAlong(p, ws, Math.max(2.5 * f, w * .45)); // la pression varie en douceur sur la longueur : bords réguliers
+  if (k === 'pen' && n > 6 && !exact && f < 1) { // tracé zoomé : pointe affinée sur une petite distance (et non sur 3 points, trop serrés quand on zoome)
+    const sl = [0]; for (let i = 1; i < n; i++) sl[i] = sl[i - 1] + dist(p[i * 3 - 3], p[i * 3 - 2], p[i * 3], p[i * 3 + 1]);
+    const L = sl[n - 1], T = Math.min(Math.max(w * .7, 2.4 * f), L * .3);
+    if (T > 0) for (let i = 0; i < n; i++) { const d = Math.min(sl[i], L - sl[i]); if (d < T) ws[i] *= .6 + .4 * d / T; }
+  } else if (k === 'pen' && n > 6 && !exact) { ws[0] *= .6; ws[1] *= .8; ws[2] *= .92; ws[n - 1] *= .65; ws[n - 2] *= .85; }
   return ws;
 }
 function sampleStroke(p, ws, step) { // points intermédiaires sur une courbe lisse qui passe par chaque point
@@ -679,30 +685,32 @@ function sampleStroke(p, ws, step) { // points intermédiaires sur une courbe li
   return out;
 }
 // Le trait = un contour lisse (bords nets) + un cœur tracé en tronçons arrondis qui bouche tout trou éventuel
-function buildStroke(p, k, w) {
+// z = zoom de l'écran au moment du tracé : en zoomant, le lissage se resserre pour garder les petits détails (les anciens traits, sans z, ne changent pas)
+function buildStroke(p, k, w, z, exact) {
   const n = p.length / 3, res = { outline: null, runs: [] };
   if (n === 0) return res;
   if (n === 1) { const r = Math.max(.6, w * (k === 'nib' ? .3 : .45) * (.5 + .7 * p[2])); const o = new Path2D(); o.moveTo(p[0] + r, p[1]); o.arc(p[0], p[1], r, 0, Math.PI * 2); res.outline = o; return res; }
-  const sp = smoothPts(p, clamp(1.6 + w * .08, 1.6, 3.2)), ws = strokeWidths(sp, k, w), q = sampleStroke(sp, ws, 1), m = q.length / 3;
+  const f = z ? clamp(.8 / z, .08, 1) : 1;
+  const sp = exact ? p : smoothPts(p, clamp(1.6 + w * .08, 1.6, 3.2) * f), ws = strokeWidths(sp, k, w, f, exact), q = exact === 1 ? sp.map((v, i) => i % 3 === 2 ? ws[(i - 2) / 3] : v) : sampleStroke(sp, ws, Math.max(.12, f)), m = q.length / 3;
   // contour
   const L = [], R = [];
   for (let i = 0; i < m; i++) {
     const a = Math.max(0, i - 2), b = Math.min(m - 1, i + 2);
     let tx = q[b * 3] - q[a * 3], ty = q[b * 3 + 1] - q[a * 3 + 1]; const l = Math.hypot(tx, ty) || 1; tx /= l; ty /= l;
-    const r = Math.max(.4, q[i * 3 + 2] / 2), x = q[i * 3], y = q[i * 3 + 1];
+    const r = Math.max(.4 * f, q[i * 3 + 2] / 2), x = q[i * 3], y = q[i * 3 + 1];
     L.push([x - ty * r, y + tx * r]); R.push([x + ty * r, y - tx * r]);
   }
   const ang = (i, sgn) => { const a = Math.max(0, i - 2), b = Math.min(m - 1, i + 2); return Math.atan2(q[b * 3 + 1] - q[a * 3 + 1], q[b * 3] - q[a * 3]) + sgn * Math.PI / 2; };
   const o = new Path2D();
   o.moveTo(L[0][0], L[0][1]); for (let i = 1; i < m; i++) o.lineTo(L[i][0], L[i][1]);
-  o.arc(q[(m - 1) * 3], q[(m - 1) * 3 + 1], Math.max(.4, q[(m - 1) * 3 + 2] / 2), ang(m - 1, 1), ang(m - 1, 1) - Math.PI, true);
+  o.arc(q[(m - 1) * 3], q[(m - 1) * 3 + 1], Math.max(.4 * f, q[(m - 1) * 3 + 2] / 2), ang(m - 1, 1), ang(m - 1, 1) - Math.PI, true);
   for (let i = m - 2; i >= 0; i--) o.lineTo(R[i][0], R[i][1]);
-  o.arc(q[0], q[1], Math.max(.4, q[2] / 2), ang(0, -1), ang(0, -1) - Math.PI, true);
+  o.arc(q[0], q[1], Math.max(.4 * f, q[2] / 2), ang(0, -1), ang(0, -1) - Math.PI, true);
   o.closePath(); res.outline = o;
   // cœur : un seul tracé, plus fin que le trait le plus fin, qui bouche les trous possibles dans les boucles serrées
   let mn = Infinity; for (let i = 0; i < m; i++) mn = Math.min(mn, q[i * 3 + 2]);
   const core = new Path2D(); core.moveTo(q[0], q[1]); for (let i = 1; i < m; i++) core.lineTo(q[i * 3], q[i * 3 + 1]);
-  res.runs.push({ w: Math.max(.5, mn * .8), p: core });
+  res.runs.push({ w: Math.max(.5 * f, mn * .8), p: core });
   return res;
 }
 function polyPath(p) {
@@ -720,7 +728,7 @@ function strokePath(it) { // surligneur et feutre : un seul tracé d'épaisseur 
 }
 function strokeShape(it) {
   let r = pathCache.get(it);
-  if (!r) { r = buildStroke(it.p, it.k, it.w); pathCache.set(it, r); }
+  if (!r) { r = buildStroke(it.p, it.k, it.w, it.z, it.xs); pathCache.set(it, r); }
   return r;
 }
 function drawStroke(ctx, it) {
@@ -924,6 +932,8 @@ function imagePalette(id) {
 
 /* ---------- Rendu d'une liste d'objets ---------- */
 // Deux calques : le décor d'abord, l'écriture par-dessus. Dans chaque calque : photos/tape/frises, puis surligneur, puis encre et texte.
+let CULL = null; // zone visible à l'écran : on ne redessine pas ce qui est en dehors
+const seen = it => !CULL || it.t === 'link' || (b => b.x2 >= CULL.x && b.x <= CULL.x2 && b.y2 >= CULL.y && b.y <= CULL.y2)(bounds(it));
 function renderLayer(ctx, items, hide) {
   for (const it of items) if ((it.t === 'img' || it.t === 'tape' || it.t === 'br') && !(hide && hide.has(it))) it.t === 'img' ? drawImageItem(ctx, it) : it.t === 'tape' ? drawTape(ctx, it) : drawBrush(ctx, it);
   for (const it of items) if (it.t === 'h' && !(hide && hide.has(it))) drawStroke(ctx, it);
@@ -931,6 +941,7 @@ function renderLayer(ctx, items, hide) {
 }
 function renderItems(ctx, items, hide) {
   // la peinture du pot passe sous toute l'encre, décor compris
+  if (CULL) items = items.filter(seen);
   for (const it of items) if (it.t === 'img' && it.fill && !(hide && hide.has(it))) drawImageItem(ctx, it);
   const rest = items.filter(i => !(i.t === 'img' && i.fill));
   renderLayer(ctx, rest.filter(i => i.L === 'd'), hide);
@@ -1012,7 +1023,7 @@ const ap = (M, x, y) => [M.a * x + M.c * y + M.e, M.b * x + M.d * y + M.f];
 function transformItem(it, M) {
   if (it.t === 's' || it.t === 'h' || it.t === 'br') {
     const p = it.p.slice(); for (let i = 0; i < p.length; i += 3) { const q = ap(M, p[i], p[i + 1]); p[i] = q[0]; p[i + 1] = q[1]; }
-    return { ...it, p, w: it.w * M.sc };
+    return { ...it, p, w: it.w * M.sc, ...(it.z ? { z: it.z / M.sc } : null) };
   }
   if (it.t === 'tape') { const [x1, y1] = ap(M, it.x1, it.y1), [x2, y2] = ap(M, it.x2, it.y2); return { ...it, x1, y1, x2, y2, w: it.w * M.sc }; }
   if (it.t === 'link') { const [x, y] = ap(M, it.x + it.w / 2, it.y + it.h / 2); const w = it.w * M.sc, hh = it.h * M.sc; return { ...it, x: x - w / 2, y: y - hh / 2, w, h: hh }; }
@@ -1104,22 +1115,24 @@ function snapAngle(ax, ay, bx, by) {
   return [bx, by];
 }
 function lineShape(ax, ay, bx, by, magnet) {
-  if (magnet) { ax = snapG(ax); ay = snapG(ay); bx = snapG(bx); by = snapG(by); }
+  const l0 = dist(ax, ay, bx, by), sa = snapG(ax), sb = snapG(ay), sc = snapG(bx), sd = snapG(by);
+  // aimant : seulement si le trait garde à peu près sa taille (un petit trait ne doit pas sauter d'un carreau à l'autre)
+  if (magnet && dist(sa, sb, sc, sd) > l0 * .6 && dist(sa, sb, sc, sd) < l0 * 1.6 && dist(ax, ay, sa, sb) < l0 * .5) { ax = sa; ay = sb; bx = sc; by = sd; }
   else[bx, by] = snapAngle(ax, ay, bx, by);
   return densify([[ax, ay], [bx, by]], false);
 }
-function recognize(flat, magnet) {
+function recognize(flat, magnet, zs = .8) { // zs = zoom de l'écran : les seuils sont comptés en pixels vus, pas en taille de page
   const P = []; for (let i = 0; i < flat.length; i += 3) P.push([flat[i], flat[i + 1]]);
-  if (P.length < 5) return null;
+  if (P.length < 3) return null;
   let x1 = 1e9, y1 = 1e9, x2 = -1e9, y2 = -1e9, len = 0;
   P.forEach(([x, y], i) => { x1 = Math.min(x1, x); y1 = Math.min(y1, y); x2 = Math.max(x2, x); y2 = Math.max(y2, y); if (i) len += dist(P[i - 1][0], P[i - 1][1], x, y); });
-  const w = x2 - x1, hh = y2 - y1, size = Math.max(w, hh); if (size < 12) return null;
+  const w = x2 - x1, hh = y2 - y1, size = Math.max(w, hh); if (size < 4.5 / zs) return null;
   const a = P[0], b = P[P.length - 1], chord = dist(a[0], a[1], b[0], b[1]);
   // Ligne droite
   let md = 0; for (const q of P) md = Math.max(md, segDist(q[0], q[1], a[0], a[1], b[0], b[1]));
-  if (chord > size * .6 && md < Math.max(7, chord * .07)) return { kind: 'line', pts: lineShape(a[0], a[1], b[0], b[1], magnet), a, b };
+  if (chord > size * .6 && md < Math.max(5.5 / zs, chord * .07)) return { kind: 'line', pts: lineShape(a[0], a[1], b[0], b[1], magnet), a, b };
   // Formes fermées
-  if (chord > size * .3) return null;
+  if (chord > size * .3 || P.length < 8 || size < 10 / zs) return null;
   const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, rx = w / 2, ry = hh / 2;
   let err = 0; for (const [x, y] of P) { const d = Math.hypot((x - cx) / (rx || 1), (y - cy) / (ry || 1)); err += Math.abs(d - 1); } err /= P.length;
   const closedP = P.concat([P[0]]); let poly = rdp(closedP, size * .09);
@@ -1470,8 +1483,8 @@ async function duplicateNotebook(nb, after = renderHome) {
 /* =========================================================
    4. Éditeur : vue, rendu, outils, gestes
    ========================================================= */
-const ED = { s: 1, tx: 0, ty: 0, rs: 0, fit: 1 };
-const MAXPX = 9e6;
+const ED = { s: 1, tx: 0, ty: 0, rs: 0, fit: 1, win: null };
+const MAXPX = 7e6, ZMAX = 14;
 const RL = 450, RH = 42; // demi-longueur et demi-hauteur de la règle
 let stage, sheet, cBg, cMain, cLive, gBg, gMain, gLive, ovl;
 const curPage = () => S.nb && S.pages.get(S.nb.pages[S.idx]);
@@ -1498,7 +1511,7 @@ function initEditor() {
   stage.addEventListener('touchstart', e => { if (e.target.closest('#selbar, .pnav, button')) return; e.preventDefault(); }, { passive: false });
   stage.addEventListener('wheel', onWheel, { passive: false });
   document.addEventListener('touchend', onTouchEnd, true); document.addEventListener('touchcancel', onTouchEnd, true);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { if (G) cancelGesture(); ptrs.clear(); RUL.ptrs.clear(); } });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { if (G && G.mode === 'draw' && G.pts.length > 6 && curPage()) { const g = G; G = null; clearTimeout(g.holdT); finishDraw(g, curPage(), g.pts[g.pts.length - 3], g.pts[g.pts.length - 2], .5); flushSaves(); } else if (G) cancelGesture(); ptrs.clear(); RUL.ptrs.clear(); } });
   ['gesturestart', 'gesturechange'].forEach(t => document.addEventListener(t, e => e.preventDefault()));
   stage.addEventListener('contextmenu', e => e.preventDefault());
   window.addEventListener('resize', () => { clearTimeout(ED.rzT); ED.rzT = setTimeout(() => { if (!$('#editor').hidden && curPage()) { fitView(); resizeCanvases(true); } }, 100); });
@@ -1564,38 +1577,69 @@ function fitView() {
 function applyView() {
   sheet.style.transform = `translate(${ED.tx}px,${ED.ty}px) scale(${ED.s})`;
   if (S.sel) placeSel();
+  checkWindow();
 }
 function clampView() {
   const r = stage.getBoundingClientRect(), w = PW * ED.s, hh = H(curPage()) * ED.s, m = 80;
   if (w > r.width) ED.tx = clamp(ED.tx, r.width - w - m, m); else ED.tx = clamp(ED.tx, -w / 2, r.width - w / 2);
   if (hh > r.height) ED.ty = clamp(ED.ty, r.height - hh - m, m); else ED.ty = clamp(ED.ty, -hh / 2, r.height - hh / 2);
 }
+// Les calques ne couvrent que la partie de la page visible à l'écran (plus une marge) : même au zoom maximum,
+// chaque point de l'écran est dessiné pour de vrai, donc tout reste net, et la mémoire utilisée reste petite.
+function visRect() {
+  const r = stage.getBoundingClientRect(), hh = H(curPage());
+  return { x: clamp(-ED.tx / ED.s, 0, PW), y: clamp(-ED.ty / ED.s, 0, hh), x2: clamp((r.width - ED.tx) / ED.s, 0, PW), y2: clamp((r.height - ED.ty) / ED.s, 0, hh) };
+}
 function resizeCanvases(force) {
   const pg = curPage(); if (!pg) return; const hh = H(pg);
-  const dpr = window.devicePixelRatio || 1;
-  const rs = Math.min(ED.s * dpr, Math.sqrt(MAXPX / (PW * hh)));
-  if (!force && ED.rs && Math.abs(rs - ED.rs) / ED.rs < .12) return;
-  ED.rs = rs;
-  for (const c of [cBg, cMain, cLive]) { c.width = Math.round(PW * rs); c.height = Math.round(hh * rs); }
+  const dpr = window.devicePixelRatio || 1, v = visRect(), vw = Math.max(1, v.x2 - v.x), vh = Math.max(1, v.y2 - v.y);
+  const sr = stage.getBoundingClientRect(), cap = clamp(sr.width * sr.height * dpr * dpr * 1.7, 2.5e6, MAXPX);
+  let rs = ED.s * dpr; if (vw * vh * rs * rs > cap) rs = Math.sqrt(cap / (vw * vh));
+  const W0 = ED.win;
+  if (!force && W0 && Math.abs(rs - ED.rs) / ED.rs < .04 && v.x >= W0.x - .5 && v.y >= W0.y - .5 && v.x2 <= W0.x2 + .5 && v.y2 <= W0.y2 + .5) return;
+  let W;
+  if (PW * hh * rs * rs <= cap) W = { x: 0, y: 0, x2: PW, y2: hh };
+  else {
+    const area = cap / (rs * rs), sum = vw + vh, m = Math.max(0, (-sum + Math.sqrt(sum * sum - 4 * (vw * vh - area))) / 4);
+    W = { x: Math.max(0, Math.floor(v.x - m)), y: Math.max(0, Math.floor(v.y - m)), x2: Math.min(PW, Math.ceil(v.x2 + m)), y2: Math.min(hh, Math.ceil(v.y2 + m)) };
+  }
+  if (!(G && (G.mode === 'pinch' || G.mode === 'finger'))) { // calque posé pile sur les points de l'écran : pas de flou
+    ED.tx = Math.round((ED.tx + W.x * ED.s) * dpr) / dpr - W.x * ED.s; ED.ty = Math.round((ED.ty + W.y * ED.s) * dpr) / dpr - W.y * ED.s;
+    sheet.style.transform = `translate(${ED.tx}px,${ED.ty}px) scale(${ED.s})`;
+  }
+  ED.rs = rs; ED.win = W; ED.winT = performance.now();
+  const cw = Math.max(1, Math.round((W.x2 - W.x) * rs)), ch = Math.max(1, Math.round((W.y2 - W.y) * rs));
+  for (const c of [cBg, cMain, cLive]) {
+    if (c.width !== cw) c.width = cw; if (c.height !== ch) c.height = ch;
+    c.style.left = W.x + 'px'; c.style.top = W.y + 'px'; c.style.width = cw / rs + 'px'; c.style.height = ch / rs + 'px';
+  }
+  sheet.style.background = pg.paper || '#fff';
   renderAll();
 }
-const ctxPage = g => g.setTransform(ED.rs, 0, 0, ED.rs, 0, 0);
+// pendant qu'on déplace ou zoome la page : si on sort de la zone dessinée, on la redessine (pas plus de 8 fois par seconde)
+function checkWindow() {
+  const W = ED.win; if (!W || ED.winRq || !curPage()) return;
+  const v = visRect(), k = ED.s * (window.devicePixelRatio || 1) / ED.rs; if (k < 1.6 && k > .4 && v.x >= W.x - .5 && v.y >= W.y - .5 && v.x2 <= W.x2 + .5 && v.y2 <= W.y2 + .5) return;
+  ED.winRq = setTimeout(() => { ED.winRq = 0; if (curPage() && !$('#editor').hidden) resizeCanvases(false); }, Math.max(16, 120 - (performance.now() - (ED.winT || 0))));
+}
+const ctxPage = g => g.setTransform(ED.rs, 0, 0, ED.rs, -ED.win.x * ED.rs, -ED.win.y * ED.rs);
+const clearPage = g => { g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, g.canvas.width, g.canvas.height); ctxPage(g); };
 function renderBg() {
-  const pg = curPage(); ctxPage(gBg); gBg.clearRect(0, 0, PW, H(pg)); drawBg(gBg, pg);
+  const pg = curPage(); clearPage(gBg); drawBg(gBg, pg);
   if (pg.trace) { // papier calque : visible pour repasser au stylo, jamais exporté
     const e = getImg(pg.trace.a);
     if (e.ready) { const k = Math.min(PW / e.w, H(pg) / e.h), w = e.w * k, hh = e.h * k; gBg.save(); gBg.globalAlpha = pg.trace.o || .3; gBg.drawImage(e.img, (PW - w) / 2, (H(pg) - hh) / 2, w, hh); gBg.restore(); }
   }
 }
 function renderMain(hide) {
-  const pg = curPage(); ctxPage(gMain); gMain.clearRect(0, 0, PW, H(pg));
-  renderItems(gMain, pg.items, hide); renderOverlay();
+  const pg = curPage(); clearPage(gMain);
+  CULL = ED.win; try { renderItems(gMain, pg.items, hide); } finally { CULL = null; } renderOverlay();
 }
 function renderAll() { renderBg(); renderMain(S.sel && S.sel.hide); clearLive(); drawSelRest(); }
 function drawSelRest() { if (S.sel && S.sel.items.length && !(G && G.mode && G.mode.startsWith('sel'))) { clearLive(); renderItems(gLive, S.sel.items); } }
 let rq = 0, rqBg = false;
 function requestRender(bg) { if (bg) rqBg = true; if (rq) return; rq = requestAnimationFrame(() => { rq = 0; if (!curPage()) return; if (rqBg) renderBg(); rqBg = false; renderMain(S.sel && S.sel.hide); }); }
-function clearLive() { gLive.setTransform(1, 0, 0, 1, 0, 0); gLive.clearRect(0, 0, cLive.width, cLive.height); ctxPage(gLive); }
+function clearLive() { clearPage(gLive); }
 function renderOverlay() {
   const pg = curPage(); ovl.innerHTML = '';
   ovl.className = 'tool-' + S.tool; ovl.id = 'ovl';
@@ -1815,7 +1859,17 @@ function onDown(e) {
       if (G && G.pid === id) { if (G.mode === 'draw' && G.pts.length > 6) { const g = G; G = null; clearTimeout(g.holdT); finishDraw(g, curPage(), g.pts[g.pts.length - 3], g.pts[g.pts.length - 2], .5); } else cancelGesture(); }
       ptrs.delete(id);
     }
-    if (G && (G.mode === 'pinch' || G.mode === 'selpinch' || G.byTouch)) { resetTouches(); }
+    // quand le stylet se pose, les doigts déjà posés sont la main qui s'appuie : on les oublie
+    if (touchesDown().length || (G && (G.mode === 'pinch' || G.mode === 'selpinch' || G.byTouch))) resetTouches();
+    ED.penT = performance.now();
+  } else if (e.pointerType === 'touch' && !e.target.closest('#selbox .h')) {
+    // paume : un contact qui arrive pendant que le stylet écrit (ou juste après) n'est pas un geste voulu
+    if ([...ptrs.values()].some(q => q.type === 'pen') || performance.now() - (ED.penT || 0) < 350) return;
+  }
+  // un geste resté « en cours » sans nouvelles depuis longtemps (relâchement perdu par l'iPad) ne doit pas bloquer la suite
+  if (G && G.pid !== undefined && G.pid !== e.pointerId && G.mode !== 'pinch' && G.mode !== 'selpinch') {
+    const q = ptrs.get(G.pid);
+    if (q && performance.now() - (q.t || q.t0) > 2500) { ptrs.delete(G.pid); if (G.mode === 'draw' && G.pts.length > 6) { const g = G; G = null; clearTimeout(g.holdT); finishDraw(g, curPage(), g.pts[g.pts.length - 3], g.pts[g.pts.length - 2], .5); } else cancelGesture(); }
   }
   if (G && G.mode !== 'pinch' && G.mode !== 'selpinch' && G.pid !== undefined && !ptrs.has(G.pid)) cancelGesture();
   if (G && (G.mode === 'pinch' || G.mode === 'selpinch') && touchesDown().length === 0) G = null;
@@ -1872,7 +1926,7 @@ function cancelGesture() {
 function onMove(e) {
   if (RUL.ptrs.has(e.pointerId)) return rulerMove(e);
   const p = ptrs.get(e.pointerId); if (!p) return;
-  p.cx = e.clientX; p.cy = e.clientY; p.t = performance.now();
+  p.cx = e.clientX; p.cy = e.clientY; p.t = performance.now(); if (p.type === 'pen') ED.penT = p.t;
   if (!G) return;
   if (G.mode === 'pinch') return updatePinch();
   if (G.mode === 'selpinch') return updateSelPinch();
@@ -1909,6 +1963,7 @@ function onMove(e) {
 function onUp(e) {
   if (RUL.ptrs.has(e.pointerId)) return rulerUp(e);
   const p = ptrs.get(e.pointerId); ptrs.delete(e.pointerId);
+  if (p && p.type === 'pen') ED.penT = performance.now();
   if (!G || !p) return;
   if (G.mode === 'pinch') { if (touchesDown().length < 2) endPinch(); return; }
   if (G.mode === 'selpinch') { if (touchesDown().length < 2) { const g = G; G = null; bakeSel(g); } return; }
@@ -1967,7 +2022,7 @@ function updatePinch() {
   const t = touchesDown().slice(0, 2).map(([, p]) => p); if (t.length < 2) return;
   const [a, b] = t, r = stage.getBoundingClientRect();
   const d = Math.hypot(b.cx - a.cx, b.cy - a.cy), mx = (a.cx + b.cx) / 2 - r.left, my = (a.cy + b.cy) / 2 - r.top;
-  const s = clamp(G.s0 * d / G.d0, ED.fit * .6, ED.fit * 6);
+  const s = clamp(G.s0 * d / G.d0, ED.fit * .6, ED.fit * ZMAX);
   const px = (G.mx - G.tx0) / G.s0, py = (G.my - G.ty0) / G.s0;
   ED.s = s; ED.tx = mx - px * s; ED.ty = my - py * s;
   G.moved = Math.max(G.moved, Math.abs(d - G.d0), Math.hypot(mx - G.mx, my - G.my));
@@ -1997,7 +2052,7 @@ function onWheel(e) {
   const r = stage.getBoundingClientRect();
   if (e.ctrlKey || e.metaKey) {
     const mx = e.clientX - r.left, my = e.clientY - r.top, px = (mx - ED.tx) / ED.s, py = (my - ED.ty) / ED.s;
-    ED.s = clamp(ED.s * Math.exp(-e.deltaY * .01), ED.fit * .6, ED.fit * 6); ED.tx = mx - px * ED.s; ED.ty = my - py * ED.s;
+    ED.s = clamp(ED.s * Math.exp(-e.deltaY * .01), ED.fit * .6, ED.fit * ZMAX); ED.tx = mx - px * ED.s; ED.ty = my - py * ED.s;
   } else { ED.tx -= e.deltaX; ED.ty -= e.deltaY; }
   clampView(); applyView(); clearTimeout(ED.wt); ED.wt = setTimeout(() => resizeCanvases(false), 200);
 }
@@ -2011,16 +2066,16 @@ function addPoint(x, y, pr) {
   if (n) {
     const lx = g.pts[n - 3], ly = g.pts[n - 2];
     // plus de lissage qui retarde le trait : on garde la position exacte du stylet (la courbe lisse est faite au rendu)
-    if (dist(lx, ly, x, y) < .5) return;
+    if (dist(lx, ly, x, y) < Math.min(.5, .35 / ED.s)) return;
   }
   g.pts.push(x, y, pr);
   if (P.autoShapes && !g.edge) {
-    if (!g.hold || dist(g.hold[0], g.hold[1], x, y) > 5) { g.hold = [x, y]; clearTimeout(g.holdT); g.holdT = setTimeout(() => tryShape(g), 560); }
+    if (!g.hold || dist(g.hold[0], g.hold[1], x, y) > 4 / ED.s) { g.hold = [x, y]; clearTimeout(g.holdT); g.holdT = setTimeout(() => tryShape(g), 560); }
   }
 }
 function tryShape(g) {
   if (G !== g || g.snap) return;
-  const r = recognize(g.pts, S.magnet); if (!r) return;
+  const r = recognize(g.pts, S.magnet, ED.s); if (!r) return;
   g.pts = toFlat(r.pts); g.snap = { kind: r.kind, a: r.a };
   if (navigator.vibrate) try { navigator.vibrate(8); } catch (e) { }
   drawLive();
@@ -2045,10 +2100,12 @@ function drawLive() {
 function strokeItem(g) {
   if (g.kind === 'hl') return { t: 'h', c: g.c, w: g.w, p: g.pts };
   if (g.kind === 'brush') return { t: 'br', m: P.tools.brush.m, c: g.c, w: g.w, p: g.pts };
-  return { t: 's', k: g.kind, c: g.c, w: g.w, p: g.pts };
+  const it = { t: 's', k: g.kind, c: g.c, w: g.w, p: g.pts, z: Math.round(ED.s * 100) / 100 };
+  if (g.snap) it.xs = g.snap.kind === 'ellipse' ? 2 : 1;
+  return it;
 }
 function finishDraw(g, pg, x, y, pr) {
-  if (!g.snap && !g.edge && g.pts.length) { const n = g.pts.length; if (dist(g.pts[n - 3], g.pts[n - 2], x, y) > .7) g.pts.push(x, y, pr); }
+  if (!g.snap && !g.edge && g.pts.length) { const n = g.pts.length; if (dist(g.pts[n - 3], g.pts[n - 2], x, y) > Math.min(.7, .5 / ED.s)) g.pts.push(x, y, pr); }
   clearLive();
   if (!g.pts.length) return;
   const it = strokeItem(g);
@@ -2331,40 +2388,53 @@ async function cutImage(item, poly, hole) {
 
 /* ---------- Pot de peinture : colorie une forme fermée, sous l'encre ---------- */
 // Calcul du remplissage (sans toucher à l'écran) : renvoie l'image de la zone coloriée ou une raison d'échec
-function computeFill(items, pageH, x, y, color) {
-  const W = PW, Hh = Math.round(pageH), sx = Math.floor(x), sy = Math.floor(y);
+// reg = { x, y, w, h, k } : zone de la page analysée et finesse (k points par unité). En zoomant, le pot de peinture
+// travaille sur ce qu'on voit, en beaucoup plus fin : il remplit proprement même les tout petits dessins.
+function computeFill(items, pageH, x, y, color, reg) {
+  const R = reg || { x: 0, y: 0, w: PW, h: Math.round(pageH), k: 1 }, k = R.k;
+  const W = Math.round(R.w * k), Hh = Math.round(R.h * k), sx = Math.floor((x - R.x) * k), sy = Math.floor((y - R.y) * k);
   if (sx < 0 || sy < 0 || sx >= W || sy >= Hh) return { err: 'out' };
   const c = document.createElement('canvas'); c.width = W; c.height = Hh; const g = c.getContext('2d');
+  g.setTransform(k, 0, 0, k, -R.x * k, -R.y * k);
   g.lineJoin = 'round'; g.lineCap = 'round'; g.strokeStyle = g.fillStyle = '#000';
   for (const it of items) {
     if (it.t !== 's') continue; // murs un peu épaissis pour fermer les petits jours entre deux traits
-    drawStroke(g, { ...it, c: '#000', w: it.w + (it.k === 'marker' ? 5 : 4) });
+    const b = bounds(it); if (b.x2 < R.x - 6 || b.x > R.x + R.w + 6 || b.y2 < R.y - 6 || b.y > R.y + R.h + 6) continue;
+    drawStroke(g, { ...it, c: '#000', w: it.w + (it.k === 'marker' ? 5 : 4) / k });
   }
   const d = g.getImageData(0, 0, W, Hh).data, N = W * Hh, wall = new Uint8Array(N);
   for (let i = 0; i < N; i++) wall[i] = d[i * 4 + 3] > 20 ? 1 : 0;
   if (wall[sy * W + sx]) return { err: 'edge' };
   const m = new Uint8Array(N), st = [sy * W + sx]; m[st[0]] = 1; let n = 0, leak = false;
   while (st.length) {
-    const k = st.pop(); n++; const px = k % W, py = (k / W) | 0;
+    const q0 = st.pop(); n++; const px = q0 % W, py = (q0 / W) | 0;
     if (px === 0 || py === 0 || px === W - 1 || py === Hh - 1) { leak = true; break; }
-    for (const q of [k - 1, k + 1, k - W, k + W]) if (!m[q] && !wall[q]) { m[q] = 1; st.push(q); }
+    for (const q of [q0 - 1, q0 + 1, q0 - W, q0 + W]) if (!m[q] && !wall[q]) { m[q] = 1; st.push(q); }
   }
-  if (leak || n > N * .55) return { err: 'leak' };
+  if (leak || (!reg && n > N * .55)) return { err: 'leak' };
   for (let it = 0; it < 4; it++) { // glisser la couleur sous le trait pour éviter un liseré blanc
     const add = [];
-    for (let k = W; k < N - W; k++) if (!m[k] && (m[k - 1] || m[k + 1] || m[k - W] || m[k + W])) add.push(k);
-    add.forEach(k => (m[k] = 1));
+    for (let q = W; q < N - W; q++) if (!m[q] && (m[q - 1] || m[q + 1] || m[q - W] || m[q + W])) add.push(q);
+    add.forEach(q => (m[q] = 1));
   }
   let x1 = W, y1 = Hh, x2 = 0, y2 = 0;
-  for (let k = 0; k < N; k++) if (m[k]) { const px = k % W, py = (k / W) | 0; if (px < x1) x1 = px; if (px > x2) x2 = px; if (py < y1) y1 = py; if (py > y2) y2 = py; }
+  for (let q = 0; q < N; q++) if (m[q]) { const px = q % W, py = (q / W) | 0; if (px < x1) x1 = px; if (px > x2) x2 = px; if (py < y1) y1 = py; if (py > y2) y2 = py; }
   const bw = x2 - x1 + 1, bh = y2 - y1 + 1, o = document.createElement('canvas'); o.width = bw; o.height = bh;
   const og = o.getContext('2d'), im = og.createImageData(bw, bh), col = parseInt(color.slice(1), 16);
   for (let yy = 0; yy < bh; yy++) for (let xx = 0; xx < bw; xx++) if (m[(yy + y1) * W + xx + x1]) { const j = (yy * bw + xx) * 4; im.data[j] = col >> 16; im.data[j + 1] = (col >> 8) & 255; im.data[j + 2] = col & 255; im.data[j + 3] = 255; }
   og.putImageData(im, 0, 0);
-  return { canvas: o, x: x1 + bw / 2, y: y1 + bh / 2, w: bw, h: bh };
+  return { canvas: o, x: R.x + (x1 + bw / 2) / k, y: R.y + (y1 + bh / 2) / k, w: bw / k, h: bh / k };
 }
-async function fillItem(items, pageH, x, y, color) {
-  const r = computeFill(items, pageH, x, y, color); if (r.err) return r;
+async function fillItem(items, pageH, x, y, color, zoomed) {
+  let r = null;
+  if (zoomed && ED.s > 1.15 && curPage()) { // zoomé : on analyse seulement la partie visible, en fin
+    const v = visRect(), mx = (v.x2 - v.x) * .15, my = (v.y2 - v.y) * .15;
+    const R = { x: Math.max(0, Math.floor(v.x - mx)), y: Math.max(0, Math.floor(v.y - my)) }; R.w = Math.min(PW, Math.ceil(v.x2 + mx)) - R.x; R.h = Math.min(Math.round(pageH), Math.ceil(v.y2 + my)) - R.y;
+    R.k = Math.min(ED.s * 1.6, 8, Math.sqrt(5e6 / (R.w * R.h)));
+    if (R.k > 1.2 && R.w > 2 && R.h > 2) { r = computeFill(items, pageH, x, y, color, R); if (r.err === 'leak' || r.err === 'out') r = null; }
+  }
+  if (!r) r = computeFill(items, pageH, x, y, color);
+  if (r.err) return r;
   const a = await putAsset(await canvasToBlob(r.canvas)); await getImg(a).p;
   return { item: { t: 'img', a, x: r.x, y: r.y, w: r.w, h: r.h, r: 0, fill: true } };
 }
@@ -2373,7 +2443,7 @@ async function fillAt(x, y) {
   // sur une image (autocollant, coloriage, photo) : on recolorie la zone de couleur touchée
   const onImg = editable(pg).reverse().find(it => it.t === 'img' && !it.fill && inBox(x, y, itemBox(it)));
   if (onImg && await fillImage(onImg, x, y)) return;
-  const r = await fillItem(pg.items, H(pg), x, y, tset('fill').c);
+  const r = await fillItem(pg.items, H(pg), x, y, tset('fill').c, true);
   if (r.err === 'edge') return toast('Touche l’intérieur de la forme, pas son contour');
   if (r.err === 'leak') return toast('Ici la couleur déborderait sur toute la page. Touche l’intérieur d’une forme fermée dessinée au stylo, ou une zone de couleur d’une image.', 4200);
   if (r.err) return;
