@@ -1,5 +1,5 @@
 /* Feuillet : tout fonctionne sans connexion après la première ouverture */
-const VERSION = 'feuillet-v11';
+const VERSION = 'feuillet-v12';
 const LOCAL = ['./', './index.html', './manifest.json', './icon-180.png', './icon-192.png', './icon-512.png'];
 const REMOTE = [
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
